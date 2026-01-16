@@ -1,14 +1,18 @@
 import os
-import random
 import uuid
 from typing import List
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+import dotenv
+from fastapi import FastAPI, HTTPException
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 
 from app.schema import StructuralPayload, MatchResponse
+from app.ai_client import AsyncAIClient
+
+# Load environment variables
+dotenv.load_dotenv()
 
 # Constants
 COLLECTION_NAME = "civic_structures"
@@ -19,27 +23,38 @@ QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", 6333))
 
 # Initialize Qdrant Client
-# We will initialize it globally, but we might want to handle it better in lifespan if strictly needed there.
-# For simplicity and standard FastAPI usage, global is often okay, but we need to ensure connection works.
 client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
-
-def get_mock_embedding() -> List[float]:
-    """Generates a random mock embedding vector."""
-    return [random.random() for _ in range(VECTOR_SIZE)]
-
+# Initialize AI Client (will be set in lifespan or global if we want simple access,
+# but let's initialize it globally to fail fast if env vars are missing, or inside lifespan)
+# To follow the pattern of the qdrant client, we can init it here,
+# but it relies on environment variables being loaded.
+# Since we called load_dotenv() above, it should be fine.
+# However, if OPENAI_API_KEY is missing, it will raise ValueError.
+# This is desirable as we want to fail startup if config is wrong.
+try:
+    ai_client = AsyncAIClient()
+except ValueError as e:
+    # If we are running in an environment where we might not have the key yet (like CI without secrets),
+    # we might want to delay this or just print a warning.
+    # But for this task, the goal is to enforce it.
+    print(f"Warning: {e}. Application might fail if OpenAI features are used.")
+    ai_client = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: Check if collection exists, if not create it
-    if not client.collection_exists(collection_name=COLLECTION_NAME):
-        client.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
-        )
-        print(f"Collection '{COLLECTION_NAME}' created.")
-    else:
-        print(f"Collection '{COLLECTION_NAME}' already exists.")
+    try:
+        if not client.collection_exists(collection_name=COLLECTION_NAME):
+            client.create_collection(
+                collection_name=COLLECTION_NAME,
+                vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
+            )
+            print(f"Collection '{COLLECTION_NAME}' created.")
+        else:
+            print(f"Collection '{COLLECTION_NAME}' already exists.")
+    except Exception as e:
+        print(f"Error connecting to Qdrant or checking collection: {e}")
 
     yield
     # Shutdown logic if any
@@ -52,27 +67,19 @@ async def health_check():
 
 @app.post("/api/v1/ingest")
 async def ingest_data(payload: StructuralPayload):
-    try:
-        point_id = payload.session_hash  # Using session_hash as ID? Or should we generate a UUID?
-        # The prompt says: "session_hash をIDとして使用（UUID生成でも可）"
-        # session_hash is a string. Qdrant IDs can be int or UUID.
-        # If session_hash is not a valid UUID string, we might need to hash it to a UUID or use a random UUID and store session_hash in payload.
-        # Let's assume session_hash is unique enough or just generate a UUID for the point ID and store session_hash in payload.
-        # Actually the prompt says "session_hash をIDとして使用".
-        # If session_hash is arbitrary string, Qdrant requires UUID or Int.
-        # Let's check if session_hash is a UUID. If not, generate a UUID based on it.
-        # For safety, let's generate a deterministic UUID from the session_hash to keep it idempotent,
-        # or just use a random UUID if we want to treat every ingestion as new.
-        # "session_hash" suggests it is a hash, likely a string.
-        # Let's try to use it as ID directly if it fits UUID format, otherwise generate one.
-        # To be safe and simple compliant with "UUID生成でも可", let's generate a new UUID for the record
-        # BUT the prompt says "session_hash をIDとして使用".
-        # Let's assume the user knows session_hash is a valid UUID or use uuid5.
+    if not ai_client:
+        raise HTTPException(status_code=500, detail="AI Client not initialized properly (missing API Key?)")
 
-        # Let's use uuid5 to generate a consistent UUID from the session_hash string.
+    try:
+        point_id = payload.session_hash
+        # Use uuid5 to generate a consistent UUID from the session_hash string
         point_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, payload.session_hash))
 
-        vector = get_mock_embedding()
+        # Construct text to embed
+        text_to_embed = f"Subject: {payload.agent_type}\nPain: {payload.pain_point}\nSystem Loop: {payload.system_loop}"
+
+        # Generate embedding
+        vector = await ai_client.get_embedding(text_to_embed)
 
         client.upsert(
             collection_name=COLLECTION_NAME,
@@ -86,14 +93,19 @@ async def ingest_data(payload: StructuralPayload):
         )
         return {"status": "indexed", "id": point_uuid}
     except Exception as e:
-        # In a real app we would log this properly
         print(f"Error ingesting data: {e}")
         return {"status": "error", "message": str(e)}
 
 @app.post("/api/v1/match", response_model=MatchResponse)
 async def match_data(payload: StructuralPayload):
+    if not ai_client:
+         raise HTTPException(status_code=500, detail="AI Client not initialized properly (missing API Key?)")
+
     try:
-        query_vector = get_mock_embedding()
+        # Construct text to embed (same logic as ingest for consistency)
+        text_to_embed = f"Subject: {payload.agent_type}\nPain: {payload.pain_point}\nSystem Loop: {payload.system_loop}"
+
+        query_vector = await ai_client.get_embedding(text_to_embed)
 
         search_result = client.search(
             collection_name=COLLECTION_NAME,
@@ -106,11 +118,10 @@ async def match_data(payload: StructuralPayload):
             matches.append({
                 "id": str(scored_point.id),
                 "score": scored_point.score,
-                "content": scored_point.payload  # returning the whole payload as content
+                "content": scored_point.payload
             })
 
         return MatchResponse(matches=matches)
     except Exception as e:
         print(f"Error matching data: {e}")
-        # Return empty list or error
         return MatchResponse(matches=[])
